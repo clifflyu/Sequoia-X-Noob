@@ -9,7 +9,7 @@
 Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python 工程化标准从零重构。
 系统以 OOP 架构、向量化计算和增量数据更新为核心设计原则，每日收盘后自动选股并推送至飞书群。
 
-数据层使用 [baostock](http://baostock.com)（免费、无需注册、无限流）拉取历史及增量日 K 数据（后复权），
+数据层使用 [baostock](http://baostock.com) 拉取历史及增量日 K 数据（后复权）；调用受全局串行锁、节流和每日安全配额保护。
 存储于本地 SQLite，彻底规避东方财富反爬问题。
 
 ---
@@ -17,8 +17,8 @@ Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python �
 ## 两种运行模式
 
 ```bash
-python main.py               # 日常模式：8进程增量补数据 + 跑策略 + 飞书推送（2~3分钟）
-python main.py --backfill     # 回填模式：全市场历史K线一次性灌入（约12分钟）
+python main.py               # 日常模式：串行增量补数据 + 跑策略 + 飞书推送
+python main.py --backfill     # 回填模式：串行回填全市场历史 K 线
 python main.py --backfill --symbols 000001,600519  # 只回填指定股票池
 python main.py --symbols 000001,600519             # 日常仅同步指定股票池
 ```
@@ -128,10 +128,10 @@ Sequoia-X/
 
 ## 数据说明
 
-- **数据源**：[baostock](http://baostock.com)（免费、无需注册、无限流）
+- **数据源**：[baostock](http://baostock.com)（串行访问；每日安全上限 45,000 次）
 - **复权方式**：后复权（hfq）— 历史价格不变，适合增量存储，避免除权导致数据错乱
 - **存储**：本地 SQLite（`data/sequoia_v2.db`），可直接拷贝到其他机器使用
-- **日常增量**：8 进程并行通过 baostock 拉取，2~3 分钟完成全市场更新
+- **日常增量**：串行通过 baostock 拉取，避免违反其禁止并发连接的规则
 
 ---
 

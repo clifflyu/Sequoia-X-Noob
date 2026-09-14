@@ -1,7 +1,7 @@
 """Sequoia-X V2 主程序入口。
 
 两种运行模式：
-  python main.py               # 日常模式：8进程增量补数据 + 跑策略 + 飞书推送（2~3分钟）
+  python main.py               # 日常模式：串行增量补数据 + 跑策略 + 飞书推送
   python main.py --backfill    # 回填模式：baostock 拉全市场历史K线（首次/补数据用，约12分钟）
 
 可通过 --symbols 限定股票池，例如：
@@ -86,7 +86,7 @@ def main() -> None:
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
-        # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
+        # ── 日常模式：串行 API 补今天 + 策略 + 推送 ──
         logger.info("开始拉取最新快照...")
         if args.symbols:
             logger.info(f"日常同步仅维护指定股票池：{len(args.symbols)} 只")

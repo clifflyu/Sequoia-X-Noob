@@ -31,28 +31,6 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
 
-def _bs_fetch_batch(tasks: list) -> list:
-    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
-    import baostock as bs
-    bs.login()
-    results = []
-    for symbol, bs_code, start, end in tasks:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="d",
-            adjustflag="1",  # 后复权
-        )
-        if rs.error_code != "0":
-            continue
-        while rs.next():
-            results.append([symbol] + rs.get_row_data())
-    bs.logout()
-    return results
-
-
 class DataEngine:
     """行情数据引擎，负责 SQLite 存储和 baostock 数据同步。"""
 
@@ -112,7 +90,7 @@ class DataEngine:
                 指定股票须已通过 ``backfill`` 写入本地数据库。
         """
         from datetime import date, timedelta
-        from multiprocessing import Pool
+        from sequoia_x.data.baostock_client import BaostockDailyLimitExceeded, BaostockSession
 
         today_str = date.today().strftime("%Y-%m-%d")
 
@@ -147,17 +125,22 @@ class DataEngine:
             logger.info("所有股票已是最新，无需更新")
             return 0
 
-        logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
-
-        n_workers = min(8, len(tasks))
-        chunks = [tasks[i::n_workers] for i in range(n_workers)]
-
-        with Pool(n_workers) as pool:
-            batch_results = pool.map(_bs_fetch_batch, chunks)
-
         all_rows = []
-        for batch in batch_results:
-            all_rows.extend(batch)
+        logger.info(f"需要更新 {len(tasks)} 只股票，按 Baostock 规则串行拉取...")
+        try:
+            with BaostockSession() as bs:
+                for symbol, bs_code, start, end in tasks:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code, "date,open,high,low,close,volume,amount",
+                        start_date=start, end_date=end, frequency="d", adjustflag="1",
+                    )
+                    if rs.error_code != "0":
+                        logger.warning(f"[{symbol}] Baostock 查询失败: {rs.error_msg}")
+                        continue
+                    while rs.next():
+                        all_rows.append([symbol] + rs.get_row_data())
+        except BaostockDailyLimitExceeded as exc:
+            logger.error(str(exc))
 
         if not all_rows:
             logger.info("无新数据（可能非交易日）")
@@ -202,34 +185,23 @@ class DataEngine:
 
         容错机制：
         - 单只股票失败自动重试 3 次，间隔递增（2s/4s/8s）
-        - 每 200 只股票自动重连 baostock（防止长连接超时）
+        - 全程使用一个受全局锁保护的串行连接，避免并发访问
         - 已入库的自动 skip，中断后可重跑续传
         """
         import time
         from datetime import date, timedelta
 
-        import baostock as bs
+        from sequoia_x.data.baostock_client import BaostockDailyLimitExceeded, BaostockSession
 
         today_str = date.today().strftime("%Y-%m-%d")
         max_retries = 3
-        reconnect_interval = 200  # 每处理 N 只股票重连一次
-
-        def _login():
-            lg = bs.login()
-            if lg.error_code != "0":
-                logger.error(f"baostock 登录失败: {lg.error_msg}")
-                return False
-            return True
-
-        if not _login():
-            return
-
         success = 0
         skipped = 0
         failed = 0
-        since_reconnect = 0
-
+        session: BaostockSession | None = None
         try:
+            session = BaostockSession()
+            bs = session.__enter__()
             total = len(symbols)
             for i, symbol in enumerate(symbols, start=1):
                 progress = f"[{i}/{total}] [{symbol}]"
@@ -238,16 +210,6 @@ class DataEngine:
                     skipped += 1
                     logger.info(f"{progress} 跳过：数据已更新至 {last_date}")
                     continue
-
-                # 定期重连，防止长连接超时
-                since_reconnect += 1
-                if since_reconnect >= reconnect_interval:
-                    bs.logout()
-                    time.sleep(1)
-                    if not _login():
-                        logger.error("重连失败，终止回填")
-                        return
-                    since_reconnect = 0
 
                 start = last_date or self.start_date
                 if last_date:
@@ -279,16 +241,14 @@ class DataEngine:
                         break
 
                     except Exception as exc:
+                        if isinstance(exc, BaostockDailyLimitExceeded):
+                            raise
                         if attempt < max_retries - 1:
                             wait = 2 ** (attempt + 1)
                             logger.warning(
                                 f"[{symbol}] 第{attempt + 1}次失败: {exc}，{wait}s 后重试"
                             )
                             time.sleep(wait)
-                            # 重连 baostock
-                            bs.logout()
-                            time.sleep(1)
-                            _login()
                         else:
                             logger.warning(f"[{symbol}] {max_retries}次重试均失败，跳过")
 
@@ -333,8 +293,11 @@ class DataEngine:
                     f"累计成功 {success}、跳过 {skipped}、失败 {failed}"
                 )
 
+        except BaostockDailyLimitExceeded as exc:
+            logger.error(str(exc))
         finally:
-            bs.logout()
+            if session is not None:
+                session.__exit__(None, None, None)
 
         logger.info(f"回填完成 — 成功: {success} | 跳过: {skipped} | 失败: {failed}")
 
@@ -342,30 +305,24 @@ class DataEngine:
 
     def get_all_symbols(self) -> list[str]:
         """通过 baostock 获取全市场 A 股代码列表。"""
-        import baostock as bs
-
-        lg = bs.login()
-        if lg.error_code != "0":
-            logger.error(f"baostock 登录失败: {lg.error_msg}")
-            return []
+        from sequoia_x.data.baostock_client import BaostockSession
 
         try:
-            rs = bs.query_stock_basic(code_name="", code="")
-            symbols = []
-            while rs.next():
-                row = rs.get_row_data()
-                code = row[0]           # "sh.600000" or "sz.000001"
-                status = row[4]         # "1" = 上市
-                stock_type = row[5]     # "1" = 股票
-                if status == "1" and stock_type == "1":
-                    symbols.append(code.split(".")[1])  # 提取纯数字代码
+            with BaostockSession() as bs:
+                rs = bs.query_stock_basic(code_name="", code="")
+                symbols = []
+                while rs.next():
+                    row = rs.get_row_data()
+                    code = row[0]           # "sh.600000" or "sz.000001"
+                    status = row[4]         # "1" = 上市
+                    stock_type = row[5]     # "1" = 股票
+                    if status == "1" and stock_type == "1":
+                        symbols.append(code.split(".")[1])  # 提取纯数字代码
             logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
             return symbols
         except Exception as e:
             logger.error(f"获取股票列表失败: {e}")
             return []
-        finally:
-            bs.logout()
 
     def get_local_symbols(self) -> list[str]:
         with sqlite3.connect(self.db_path) as conn:

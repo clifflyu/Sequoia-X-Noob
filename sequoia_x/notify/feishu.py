@@ -52,16 +52,19 @@ class FeishuNotifier:
     @staticmethod
     def _get_stock_names(symbols: list[str]) -> dict[str, str]:
         """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
-        import baostock as bs
-        bs.login()
+        from sequoia_x.data.baostock_client import BaostockSession
+
         mapping = {}
-        for code in symbols:
-            prefix = "sh" if code.startswith(("6", "9")) else "sz"
-            rs = bs.query_stock_basic(code=f"{prefix}.{code}")
-            while rs.next():
-                row = rs.get_row_data()
-                mapping[code] = row[1]  # 第2个字段是股票名称
-        bs.logout()
+        try:
+            with BaostockSession() as bs:
+                for code in symbols:
+                    prefix = "sh" if code.startswith(("6", "9")) else "sz"
+                    rs = bs.query_stock_basic(code=f"{prefix}.{code}")
+                    while rs.next():
+                        row = rs.get_row_data()
+                        mapping[code] = row[1]  # 第2个字段是股票名称
+        except Exception as exc:
+            logger.warning(f"Baostock 股票名称查询失败: {exc}")
         return mapping
 
     @staticmethod
@@ -87,36 +90,26 @@ class FeishuNotifier:
         if not signal_dates:
             return
 
-        import baostock as bs
-
-        login = bs.login()
-        if login.error_code != "0":
-            logger.warning(f"baostock 登录失败，无法获取未复权交易计划价格: {login.error_msg}")
-            return
+        from sequoia_x.data.baostock_client import BaostockSession
 
         try:
-            for symbol, signal_date in signal_dates.items():
-                code = self.engine._to_baostock_code(symbol)
-                rs = bs.query_history_k_data_plus(
-                    code,
-                    "date,high,low",
-                    start_date=signal_date,
-                    end_date=signal_date,
-                    frequency="d",
-                    adjustflag="3",  # 不复权：交易所实际报价
-                )
-                if rs.error_code != "0" or not rs.next():
-                    logger.warning(f"[{symbol}] 未获取到信号日未复权价格: {rs.error_msg}")
-                    continue
-                _, high, low = rs.get_row_data()
-                entry, stop = float(high), float(low)
-                if entry > stop > 0:
-                    self._unadjusted_signal_prices[(symbol, signal_date)] = (entry, stop)
+            with BaostockSession() as bs:
+                for symbol, signal_date in signal_dates.items():
+                    code = self.engine._to_baostock_code(symbol)
+                    rs = bs.query_history_k_data_plus(
+                        code, "date,high,low", start_date=signal_date,
+                        end_date=signal_date, frequency="d", adjustflag="3",
+                    )
+                    if rs.error_code != "0" or not rs.next():
+                        logger.warning(f"[{symbol}] 未获取到信号日未复权价格: {rs.error_msg}")
+                        continue
+                    _, high, low = rs.get_row_data()
+                    entry, stop = float(high), float(low)
+                    if entry > stop > 0:
+                        self._unadjusted_signal_prices[(symbol, signal_date)] = (entry, stop)
         except Exception as exc:
             # 行情补数失败时，通知仍应可以发送，只是不展示可能错误的价格。
             logger.warning(f"未复权交易计划价格获取失败: {exc}")
-        finally:
-            bs.logout()
 
     def _trade_plan(self, symbol: str, strategy_name: str) -> tuple[str, str, str, str]:
         """为一个策略信号生成可执行的条件单计划。
