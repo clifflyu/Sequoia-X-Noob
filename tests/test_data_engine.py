@@ -51,3 +51,57 @@ def test_unique_symbol_date_constraint(symbol: str, trade_date: date) -> None:
                 (symbol, str(trade_date)),
             ).fetchone()[0]
         assert count == 1
+
+
+def test_incremental_upsert_does_not_remove_other_symbols() -> None:
+    """指定股票池同步时，不能删除同日但不在该股票池中的历史数据。"""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        with sqlite3.connect(engine.db_path) as conn:
+            conn.execute(
+                "INSERT INTO stock_daily (symbol, date, close) VALUES (?, ?, ?)",
+                ("600519", "2025-01-02", 1500.0),
+            )
+            conn.commit()
+
+        engine._upsert_daily(
+            pd.DataFrame(
+                [{
+                    "symbol": "000001", "date": "2025-01-02", "open": 10.0,
+                    "high": 11.0, "low": 9.0, "close": 10.5,
+                    "volume": 1000.0, "turnover": 10500.0,
+                }]
+            )
+        )
+
+        with sqlite3.connect(engine.db_path) as conn:
+            other_symbol = conn.execute(
+                "SELECT close FROM stock_daily WHERE symbol = ? AND date = ?",
+                ("600519", "2025-01-02"),
+            ).fetchone()
+            updated_symbol = conn.execute(
+                "SELECT close FROM stock_daily WHERE symbol = ? AND date = ?",
+                ("000001", "2025-01-02"),
+            ).fetchone()
+
+        assert other_symbol == (1500.0,)
+        assert updated_symbol == (10.5,)
+
+
+def test_universe_limits_local_symbols() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        engine._upsert_daily(
+            pd.DataFrame(
+                [
+                    {"symbol": "000001", "date": "2025-01-02", "open": 10.0, "high": 11.0,
+                     "low": 9.0, "close": 10.5, "volume": 1000.0, "turnover": 10500.0},
+                    {"symbol": "600519", "date": "2025-01-02", "open": 1500.0, "high": 1510.0,
+                     "low": 1490.0, "close": 1505.0, "volume": 1000.0, "turnover": 1505000.0},
+                ]
+            )
+        )
+
+        engine.set_universe(["600519"])
+
+        assert engine.get_local_symbols() == ["600519"]

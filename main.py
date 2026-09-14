@@ -3,6 +3,9 @@
 两种运行模式：
   python main.py               # 日常模式：8进程增量补数据 + 跑策略 + 飞书推送（2~3分钟）
   python main.py --backfill    # 回填模式：baostock 拉全市场历史K线（首次/补数据用，约12分钟）
+
+可通过 --symbols 限定股票池，例如：
+  python main.py --backfill --symbols 000001,600519
 """
 
 import argparse
@@ -29,12 +32,36 @@ from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
 
 
+def parse_symbols(value: str | None) -> list[str] | None:
+    """将逗号分隔的 A 股代码规范化为去重后的 6 位代码列表。"""
+    if value is None:
+        return None
+
+    symbols = [symbol.strip() for symbol in value.split(",")]
+    if not any(symbols):
+        raise argparse.ArgumentTypeError("--symbols 至少需要一个 6 位股票代码")
+
+    invalid = [symbol for symbol in symbols if len(symbol) != 6 or not symbol.isdigit()]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"--symbols 仅支持逗号分隔的 6 位数字代码，非法值：{', '.join(invalid)}"
+        )
+
+    return list(dict.fromkeys(symbols))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sequoia-X V2 选股系统")
     parser.add_argument(
         "--backfill",
         action="store_true",
         help="回填模式：通过 baostock 拉取全市场历史 K 线（约12分钟）",
+    )
+    parser.add_argument(
+        "--symbols",
+        type=parse_symbols,
+        metavar="CODE[,CODE...]",
+        help="仅维护指定股票池，例如 000001,600519；省略时维持原有全市场行为",
     )
     args = parser.parse_args()
 
@@ -48,18 +75,22 @@ def main() -> None:
 
         # 3. 初始化数据引擎
         engine = DataEngine(settings)
+        engine.set_universe(args.symbols)
 
         if args.backfill:
             # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
             logger.info("进入回填模式...")
-            all_symbols = engine.get_all_symbols()
-            engine.backfill(all_symbols)
+            symbols = args.symbols or engine.get_all_symbols()
+            logger.info(f"回填股票池：{len(symbols)} 只")
+            engine.backfill(symbols)
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
         # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
         logger.info("开始拉取最新快照...")
-        count = engine.sync_today_bulk()
+        if args.symbols:
+            logger.info(f"日常同步仅维护指定股票池：{len(args.symbols)} 只")
+        count = engine.sync_today_bulk(symbols=args.symbols)
         logger.info(f"快照同步完成，写入 {count} 只股票")
 
         # 4. 策略列表（新增策略在此追加即可）
@@ -73,7 +104,7 @@ def main() -> None:
             PrivatePlacementStrategy(engine=engine, settings=settings),
         ]
 
-        notifier = FeishuNotifier(settings)
+        notifier = FeishuNotifier(settings, engine=engine)
 
         # 5. 遍历策略，有结果则推送至对应机器人
         for strategy in strategies:
@@ -81,7 +112,9 @@ def main() -> None:
             logger.info(f"执行策略：{strategy_name}")
 
             selected: list[str] = strategy.run()
-            logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
+            raw_count = len(selected)
+            selected = selected[: FeishuNotifier.MAX_STOCKS_PER_STRATEGY]
+            logger.info(f"{strategy_name} 选出 {raw_count} 只，推送前 {len(selected)} 只")
 
             if selected:
                 notifier.send(

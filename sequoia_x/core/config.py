@@ -58,17 +58,18 @@ class Settings(BaseSettings):
 
     def get_webhook_url(self, webhook_key: str) -> str:
         """
-        根据 webhook_key 返回对应的 Webhook URL。
+        返回统一的 Webhook URL。
 
-        优先从 strategy_webhooks 查找，找不到则 fallback 到 feishu_webhook_url。
+        webhook_key 仅为兼容旧调用保留；所有策略均使用
+        FEISHU_WEBHOOK_URL 对应的同一个机器人。
 
         Args:
-            webhook_key: 策略标识，如 'ma_volume'、'breakout'。
+            webhook_key: 忽略，仅为兼容旧调用保留。
 
         Returns:
             对应的 Webhook URL 字符串。
         """
-        return self.strategy_webhooks.get(webhook_key.lower(), self.feishu_webhook_url)
+        return self.feishu_webhook_url
 
 
 _settings: Settings | None = None

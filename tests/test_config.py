@@ -35,3 +35,12 @@ def test_missing_required_field_raises() -> None:
     finally:
         if env_backup is not None:
             os.environ["FEISHU_WEBHOOK_URL"] = env_backup
+
+
+def test_all_strategy_keys_use_the_same_webhook() -> None:
+    """策略键不能改变统一的飞书推送地址。"""
+    from sequoia_x.core.config import Settings
+
+    settings = Settings(feishu_webhook_url="https://example.com/unified")
+    assert settings.get_webhook_url("ma_volume") == "https://example.com/unified"
+    assert settings.get_webhook_url("rps") == "https://example.com/unified"

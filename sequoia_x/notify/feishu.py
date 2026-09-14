@@ -6,6 +6,7 @@ from datetime import date
 import requests
 
 from sequoia_x.core.config import Settings
+from sequoia_x.data.engine import DataEngine
 from sequoia_x.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -14,12 +15,12 @@ logger = get_logger(__name__)
 class FeishuNotifier:
     """飞书 Webhook 推送器。
 
-    根据策略的 webhook_key 路由到对应的飞书机器人。
-    若 webhook_key 未在 Settings.strategy_webhooks 中配置，
-    则 fallback 到 Settings.feishu_webhook_url。
+    所有策略统一推送到 Settings.feishu_webhook_url 配置的飞书机器人。
     """
 
-    def __init__(self, settings: Settings) -> None:
+    MAX_STOCKS_PER_STRATEGY = 3
+
+    def __init__(self, settings: Settings, engine: DataEngine | None = None) -> None:
         """
         初始化 FeishuNotifier。
 
@@ -27,6 +28,7 @@ class FeishuNotifier:
             settings: Settings 实例，提供 Webhook URL 配置。
         """
         self.settings = settings
+        self.engine = engine
 
     @staticmethod
     def _to_xueqiu_code(code: str) -> str:
@@ -52,17 +54,113 @@ class FeishuNotifier:
         bs.logout()
         return mapping
 
+    @staticmethod
+    def _price(value: float) -> str:
+        """将价格格式化为两位小数。"""
+        return f"{value:.2f}"
+
+    def _trade_plan(self, symbol: str, strategy_name: str) -> tuple[str, str, str, str]:
+        """为一个策略信号生成可执行的条件单计划。
+
+        计划是规则化的风险提示，不是即时买卖指令：进场必须在下一交易日满足
+        确认条件；止损和离场条件同时给出，避免只推送方向而没有退出纪律。
+        """
+        if strategy_name == "PrivatePlacementStrategy":
+            return (
+                "仅观察：先阅读定增用途、发行价/折价、认购方与锁定期；"
+                "公告后不因消息本身直接买入。",
+                "若定增方案终止、用途不及预期，或价格跌破公告日前低点，则放弃跟踪。",
+                "基本面兑现后再评估；公告事件不设机械止盈。",
+                "公告事件（非交易日信号）",
+            )
+
+        if self.engine is None:
+            return (
+                "下一交易日仅在放量突破信号日最高价时进场。",
+                "收盘跌破信号日最低价即离场。",
+                "达到 2 倍初始风险收益，或趋势条件失效时分批离场。",
+                "未取得",
+            )
+
+        try:
+            df = self.engine.get_ohlcv(symbol)
+            if df.empty:
+                raise ValueError("无本地K线")
+            last = df.iloc[-1]
+            entry = float(last["high"])
+            stop = float(last["low"])
+            signal_date = str(last["date"])[:10]
+            if entry <= stop or stop <= 0:
+                raise ValueError("K线价格无效")
+            target = entry + (entry - stop) * 2
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            logger.warning(f"[{symbol}] 无法生成精确交易计划：{exc}")
+            return (
+                "下一交易日仅在放量突破信号日最高价时进场。",
+                "收盘跌破信号日最低价即离场。",
+                "达到 2 倍初始风险收益，或趋势条件失效时分批离场。",
+                "未取得",
+            )
+
+        entry_text = (
+            f"下一交易日放量突破 {self._price(entry)} 后进场；"
+            "未突破不追买。"
+        )
+        stop_text = f"收盘跌破信号日低点 {self._price(stop)}，次日离场。"
+        exit_text = f"先看 {self._price(target)}（2R）；未到目标但趋势条件失效也离场。"
+
+        if strategy_name == "LimitUpShakeoutStrategy":
+            entry_text = f"下一交易日突破洗盘日高点 {self._price(entry)} 后进场；未突破不买。"
+        elif strategy_name == "UptrendLimitDownStrategy":
+            entry_text = f"不抄跌停：仅在下一交易日收复跌停日高点 {self._price(entry)} 后进场。"
+        elif strategy_name == "HighTightFlagStrategy":
+            entry_text = f"放量突破旗形整理高点 {self._price(entry)} 后进场；整理未破不买。"
+        elif strategy_name == "RpsBreakoutStrategy":
+            entry_text = f"RPS 保持强势且放量突破当日高点 {self._price(entry)} 后进场。"
+
+        return entry_text, stop_text, exit_text, signal_date
+
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
+        # 策略的原始结果可多于 3 只，但机器人只推送排在前面的 3 只。
+        symbols = symbols[: self.MAX_STOCKS_PER_STRATEGY]
         today = date.today().strftime("%Y-%m-%d")
         names = self._get_stock_names(symbols)
 
-        links: list[str] = []
+        stock_elements: list[dict] = []
         for code in symbols:
             xq_code = self._to_xueqiu_code(code)
             name = names.get(code, xq_code)
-            links.append(f"[{name}](https://xueqiu.com/S/{xq_code})")
+            entry, stop, exit, signal_date = self._trade_plan(code, strategy_name)
+            stock_elements.append(
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                            "content": (
+                                f"**[{name}（{code}）](https://xueqiu.com/S/{xq_code})**\n"
+                                f"**信号 K 线日期：** {signal_date}\n"
+                                f"**进场：** {entry}\n"
+                            f"**止损：** {stop}\n"
+                            f"**离场：** {exit}"
+                        ),
+                    },
+                }
+            )
 
-        symbol_text = " ".join(links) if links else "（无选股结果）"
+        elements: list[dict] = [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"**日期：** {today}\n**策略：** {strategy_name}\n"
+                        f"**推送数量：** {len(symbols)}（每个策略最多 3 只）"
+                    ),
+                },
+            },
+            {"tag": "hr"},
+        ]
+        elements.extend(stock_elements)
 
         return {
             "msg_type": "interactive",
@@ -74,23 +172,7 @@ class FeishuNotifier:
                     },
                     "template": "blue",
                 },
-                "elements": [
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": f"**日期：** {today}\n**策略：** {strategy_name}\n**选股数量：** {len(symbols)}",
-                        },
-                    },
-                    {"tag": "hr"},
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": f"**选股列表：**\n{symbol_text}",
-                        },
-                    },
-                ],
+                "elements": elements,
             },
         }
 
@@ -103,13 +185,12 @@ class FeishuNotifier:
         """
         将选股结果格式化为飞书卡片消息并 POST 至对应 Webhook。
 
-        根据 webhook_key 从 Settings 中查找专属 URL；
-        若未配置，则 fallback 到 feishu_webhook_url。
+        所有策略统一使用 FEISHU_WEBHOOK_URL。
 
         Args:
-            symbols: 选股结果代码列表。
+            symbols: 选股结果代码列表；仅推送前 3 只。
             strategy_name: 策略名称，用于卡片标题。
-            webhook_key: 策略标识，用于路由到对应飞书机器人。
+            webhook_key: 策略标识，仅用于日志标记。
 
         Raises:
             不抛出异常，HTTP 失败时记录 ERROR 日志。
@@ -134,7 +215,8 @@ class FeishuNotifier:
                     f"HTTP状态={resp.status_code} 飞书响应={resp.text}"
                 )
             else:
-                logger.info(f"飞书推送成功 [{webhook_key}]，共 {len(symbols)} 只股票")
+                pushed = min(len(symbols), self.MAX_STOCKS_PER_STRATEGY)
+                logger.info(f"飞书推送成功 [{webhook_key}]，共推送 {pushed} 只股票")
 
         except requests.RequestException as exc:
             logger.error(f"飞书推送请求异常 [{webhook_key}]：{exc}")

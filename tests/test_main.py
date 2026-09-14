@@ -1,5 +1,6 @@
 """主程序入口属性测试。"""
 
+import argparse
 import sys
 from unittest.mock import patch
 
@@ -9,6 +10,16 @@ from hypothesis import strategies as st
 
 # 预先导入 main 模块，避免在 @given 循环中重复导入
 import main as main_module
+
+
+def test_parse_symbols_normalizes_and_deduplicates() -> None:
+    assert main_module.parse_symbols(" 000001,600519,000001 ") == ["000001", "600519"]
+
+
+@pytest.mark.parametrize("value", ["", "000001,not-a-code", "12345", "000001,"])
+def test_parse_symbols_rejects_invalid_values(value: str) -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        main_module.parse_symbols(value)
 
 
 # Feature: sequoia-x-v2, Property 13: 主程序异常以非零退出码终止

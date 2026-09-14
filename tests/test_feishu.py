@@ -20,7 +20,7 @@ def make_settings(webhook_url: str = "https://example.com/default") -> Settings:
     )
 
 
-# Feature: sequoia-x-v2, Property 10: 飞书通知包含所有选股结果
+# Feature: 每个策略的飞书通知最多推送 3 只股票
 @given(
     symbols=st.lists(
         st.text(min_size=6, max_size=6, alphabet="0123456789"),
@@ -28,20 +28,36 @@ def make_settings(webhook_url: str = "https://example.com/default") -> Settings:
     )
 )
 @h_settings(max_examples=50)
-def test_notification_contains_all_symbols(symbols: list[str]) -> None:
-    """属性 10：send() 发出的请求体应包含所有 symbol。"""
+def test_notification_contains_at_most_three_symbols(symbols: list[str]) -> None:
+    """通知仅包含输入列表的前 3 个股票代码。"""
     settings = make_settings()
     notifier = FeishuNotifier(settings)
 
-    with patch("requests.post") as mock_post:
-        mock_post.return_value = MagicMock(status_code=200)
-        notifier.send(symbols=symbols, strategy_name="TestStrategy")
+    with patch.object(notifier, "_get_stock_names", return_value={}):
+        with patch("requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            notifier.send(symbols=symbols, strategy_name="TestStrategy")
 
     call_args = mock_post.call_args
     body = json.loads(call_args.kwargs.get("data") or call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs["data"])
     card_text = json.dumps(body)
-    for symbol in symbols:
+    for symbol in symbols[:3]:
         assert symbol in card_text
+    for symbol in symbols[3:]:
+        assert symbol not in card_text
+
+
+def test_notification_includes_trade_plan() -> None:
+    """每只推送股票都应包含进场、止损和离场条件。"""
+    notifier = FeishuNotifier(make_settings())
+    with patch.object(notifier, "_get_stock_names", return_value={"000001": "平安银行"}):
+        card = notifier._build_card(["000001"], "MaVolumeStrategy")
+
+    content = card["card"]["elements"][2]["text"]["content"]
+    assert "信号 K 线日期" in content
+    assert "进场" in content
+    assert "止损" in content
+    assert "离场" in content
 
 
 # Feature: sequoia-x-v2, Property 11: 飞书通知使用 ConfigManager 中的 Webhook URL
@@ -54,9 +70,10 @@ def test_notification_uses_config_url(webhook_url: str) -> None:
     settings = make_settings(webhook_url=webhook_url)
     notifier = FeishuNotifier(settings)
 
-    with patch("requests.post") as mock_post:
-        mock_post.return_value = MagicMock(status_code=200)
-        notifier.send(symbols=["000001"], strategy_name="Test", webhook_key="default")
+    with patch.object(notifier, "_get_stock_names", return_value={}):
+        with patch("requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            notifier.send(symbols=["000001"], strategy_name="Test", webhook_key="default")
 
     called_url = mock_post.call_args.args[0] if mock_post.call_args.args else mock_post.call_args.kwargs.get("url")
     assert called_url == webhook_url
@@ -84,9 +101,10 @@ def test_http_failure_logs_error(status_code: int) -> None:
     handler = _ListHandler(_logging.ERROR)
     feishu_logger.addHandler(handler)
     try:
-        with patch("requests.post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=status_code, text="error")
-            notifier.send(symbols=["000001"], strategy_name="Test")
+        with patch.object(notifier, "_get_stock_names", return_value={}):
+            with patch("requests.post") as mock_post:
+                mock_post.return_value = MagicMock(status_code=status_code, text="error")
+                notifier.send(symbols=["000001"], strategy_name="Test")
     finally:
         feishu_logger.removeHandler(handler)
 

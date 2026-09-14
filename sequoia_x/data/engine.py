@@ -59,7 +59,17 @@ class DataEngine:
     def __init__(self, settings: Settings) -> None:
         self.db_path: str = settings.db_path
         self.start_date: str = settings.start_date
+        self._universe: list[str] | None = None
         self._init_db()
+
+    def set_universe(self, symbols: list[str] | None) -> None:
+        """设置本次运行的股票池；``None`` 表示使用本地全部股票。"""
+        self._universe = list(dict.fromkeys(symbols)) if symbols is not None else None
+
+    @property
+    def is_universe_limited(self) -> bool:
+        """当前运行是否限定了股票池。"""
+        return self._universe is not None
 
     def _init_db(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -94,8 +104,13 @@ class DataEngine:
 
     # ── 数据同步 ──
 
-    def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
+    def sync_today_bulk(self, symbols: list[str] | None = None) -> int:
+        """同步本地股票或指定股票池的增量日 K 数据（后复权）。
+
+        Args:
+            symbols: 指定时只同步该股票池；为 ``None`` 时同步本地全部股票。
+                指定股票须已通过 ``backfill`` 写入本地数据库。
+        """
         from datetime import date, timedelta
         from multiprocessing import Pool
 
@@ -103,12 +118,21 @@ class DataEngine:
 
         tasks = []
         with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
-            ).fetchall()
+            if symbols is None:
+                rows = conn.execute(
+                    "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
+                ).fetchall()
+            else:
+                placeholders = ", ".join("?" for _ in symbols)
+                rows = conn.execute(
+                    f"SELECT symbol, MAX(date) FROM stock_daily "
+                    f"WHERE symbol IN ({placeholders}) GROUP BY symbol",
+                    symbols,
+                ).fetchall()
 
         if not rows:
-            logger.warning("本地无股票数据，请先执行 --backfill")
+            scope = "指定股票池" if symbols is not None else "本地股票池"
+            logger.warning(f"{scope}无股票数据，请先执行 --backfill")
             return 0
 
         for symbol, last_date in rows:
@@ -146,14 +170,32 @@ class DataEngine:
         df = df[df["volume"] > 0]
 
         count = len(df)
-        with sqlite3.connect(self.db_path) as conn:
-            for d in df["date"].unique().tolist():
-                conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
-            conn.commit()
+        self._upsert_daily(df)
 
         logger.info(f"sync_today_bulk: 写入 {count} 条数据")
         return count
+
+    def _upsert_daily(self, df: pd.DataFrame) -> None:
+        """按 ``(symbol, date)`` 幂等写入日 K，避免部分同步覆盖其他股票。"""
+        with sqlite3.connect(self.db_path) as conn:
+            records = df[
+                ["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]
+            ].itertuples(index=False, name=None)
+            conn.executemany(
+                """
+                INSERT INTO stock_daily (symbol, date, open, high, low, close, volume, turnover)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, date) DO UPDATE SET
+                    open = excluded.open,
+                    high = excluded.high,
+                    low = excluded.low,
+                    close = excluded.close,
+                    volume = excluded.volume,
+                    turnover = excluded.turnover
+                """,
+                records,
+            )
+            conn.commit()
 
     def backfill(self, symbols: list[str]) -> None:
         """通过 baostock 批量回填历史日 K 线数据（后复权）。
@@ -188,15 +230,13 @@ class DataEngine:
         since_reconnect = 0
 
         try:
-            for i, symbol in enumerate(symbols):
+            total = len(symbols)
+            for i, symbol in enumerate(symbols, start=1):
+                progress = f"[{i}/{total}] [{symbol}]"
                 last_date = self._get_last_date(symbol)
                 if last_date and last_date >= today_str:
                     skipped += 1
-                    if (i + 1) % 500 == 0:
-                        logger.info(
-                            f"已处理 {i + 1}/{len(symbols)}，"
-                            f"成功 {success} 跳过 {skipped} 失败 {failed}"
-                        )
+                    logger.info(f"{progress} 跳过：数据已更新至 {last_date}")
                     continue
 
                 # 定期重连，防止长连接超时
@@ -254,10 +294,12 @@ class DataEngine:
 
                 if not query_ok:
                     failed += 1
+                    logger.error(f"{progress} 失败：历史 K 线查询失败")
                     continue
 
                 if not rows:
                     skipped += 1
+                    logger.info(f"{progress} 跳过：{start} 至 {today_str} 无新增 K 线")
                     continue
 
                 df = pd.DataFrame(rows, columns=rs.fields)
@@ -268,6 +310,7 @@ class DataEngine:
 
                 if df.empty:
                     skipped += 1
+                    logger.info(f"{progress} 跳过：返回数据没有有效成交量")
                     continue
 
                 df["symbol"] = symbol
@@ -284,12 +327,11 @@ class DataEngine:
                     pass
 
                 success += 1
-
-                if (i + 1) % 500 == 0:
-                    logger.info(
-                        f"已处理 {i + 1}/{len(symbols)}，"
-                        f"成功 {success} 跳过 {skipped} 失败 {failed}"
-                    )
+                end = str(df["date"].iloc[-1])
+                logger.info(
+                    f"{progress} 完成：写入 {len(df)} 条 K 线（{start} 至 {end}）；"
+                    f"累计成功 {success}、跳过 {skipped}、失败 {failed}"
+                )
 
         finally:
             bs.logout()
@@ -327,7 +369,14 @@ class DataEngine:
 
     def get_local_symbols(self) -> list[str]:
         with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT symbol FROM stock_daily"
-            ).fetchall()
+            if self._universe is None:
+                rows = conn.execute(
+                    "SELECT DISTINCT symbol FROM stock_daily"
+                ).fetchall()
+            else:
+                placeholders = ", ".join("?" for _ in self._universe)
+                rows = conn.execute(
+                    f"SELECT DISTINCT symbol FROM stock_daily WHERE symbol IN ({placeholders})",
+                    self._universe,
+                ).fetchall()
         return [row[0] for row in rows]

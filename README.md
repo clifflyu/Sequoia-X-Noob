@@ -19,6 +19,8 @@ Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python �
 ```bash
 python main.py               # 日常模式：8进程增量补数据 + 跑策略 + 飞书推送（2~3分钟）
 python main.py --backfill     # 回填模式：全市场历史K线一次性灌入（约12分钟）
+python main.py --backfill --symbols 000001,600519  # 只回填指定股票池
+python main.py --symbols 000001,600519             # 日常仅同步指定股票池
 ```
 
 ---
@@ -66,6 +68,20 @@ python main.py --backfill
 ```
 
 约 12 分钟完成 ~5200 只 A 股历史后复权日 K 数据回填。
+
+若只跟踪自选池，不需要下载全市场。股票代码使用逗号分隔：
+
+```bash
+python main.py --backfill --symbols 000001,600519,300750
+```
+
+之后日常运行也固定同一股票池：
+
+```bash
+python main.py --symbols 000001,600519,300750
+```
+
+省略 `--symbols` 时，行为保持不变：回填全市场，日常同步本地库中的全部股票。
 
 ### 4. 日常运行
 

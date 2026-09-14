@@ -69,5 +69,10 @@ class PrivatePlacementStrategy(BaseStrategy):
                 seen.add(s)
                 unique_symbols.append(s)
 
+        # --symbols 指定了股票池时，公告监控也只推送池内股票。
+        universe = self.engine.get_local_symbols()
+        if self.engine.is_universe_limited:
+            unique_symbols = [symbol for symbol in unique_symbols if symbol in universe]
+
         logger.info(f"PrivatePlacementStrategy 选出 {len(unique_symbols)} 只股票")
         return unique_symbols
