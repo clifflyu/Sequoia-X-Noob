@@ -52,11 +52,11 @@ class FeishuNotifier:
     @staticmethod
     def _get_stock_names(symbols: list[str]) -> dict[str, str]:
         """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
-        from sequoia_x.data.baostock_client import BaostockSession
+        from sequoia_x.data.baostock_client import MarketDataSession
 
         mapping = {}
         try:
-            with BaostockSession() as bs:
+            with MarketDataSession() as bs:
                 for code in symbols:
                     prefix = "sh" if code.startswith(("6", "9")) else "sz"
                     rs = bs.query_stock_basic(code=f"{prefix}.{code}")
@@ -90,10 +90,10 @@ class FeishuNotifier:
         if not signal_dates:
             return
 
-        from sequoia_x.data.baostock_client import BaostockSession
+        from sequoia_x.data.baostock_client import MarketDataSession
 
         try:
-            with BaostockSession() as bs:
+            with MarketDataSession() as bs:
                 for symbol, signal_date in signal_dates.items():
                     code = self.engine._to_baostock_code(symbol)
                     rs = bs.query_history_k_data_plus(

@@ -29,12 +29,12 @@ class TurtleTradeStrategy(BaseStrategy):
         流通股本 = 成交量 / (换手率% / 100)
         流通市值 = 流通股本 × 不复权收盘价
         """
-        from sequoia_x.data.baostock_client import BaostockSession
+        from sequoia_x.data.baostock_client import MarketDataSession
 
         market_caps: dict[str, float] = {}
 
         try:
-            with BaostockSession() as bs:
+            with MarketDataSession() as bs:
                 for symbol in symbols:
                     bs_code = self.engine._to_baostock_code(symbol)
                     rs = bs.query_history_k_data_plus(

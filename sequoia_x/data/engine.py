@@ -90,7 +90,7 @@ class DataEngine:
                 指定股票须已通过 ``backfill`` 写入本地数据库。
         """
         from datetime import date, timedelta
-        from sequoia_x.data.baostock_client import BaostockDailyLimitExceeded, BaostockSession
+        from sequoia_x.data.baostock_client import MarketDataSession
 
         today_str = date.today().strftime("%Y-%m-%d")
 
@@ -128,7 +128,7 @@ class DataEngine:
         all_rows = []
         logger.info(f"需要更新 {len(tasks)} 只股票，按 Baostock 规则串行拉取...")
         try:
-            with BaostockSession() as bs:
+            with MarketDataSession() as bs:
                 for symbol, bs_code, start, end in tasks:
                     rs = bs.query_history_k_data_plus(
                         bs_code, "date,open,high,low,close,volume,amount",
@@ -139,8 +139,8 @@ class DataEngine:
                         continue
                     while rs.next():
                         all_rows.append([symbol] + rs.get_row_data())
-        except BaostockDailyLimitExceeded as exc:
-            logger.error(str(exc))
+        except Exception as exc:
+            logger.error(f"行情同步失败（Baostock/AKShare）: {exc}")
 
         if not all_rows:
             logger.info("无新数据（可能非交易日）")
@@ -191,16 +191,16 @@ class DataEngine:
         import time
         from datetime import date, timedelta
 
-        from sequoia_x.data.baostock_client import BaostockDailyLimitExceeded, BaostockSession
+        from sequoia_x.data.baostock_client import MarketDataSession
 
         today_str = date.today().strftime("%Y-%m-%d")
         max_retries = 3
         success = 0
         skipped = 0
         failed = 0
-        session: BaostockSession | None = None
+        session: MarketDataSession | None = None
         try:
-            session = BaostockSession()
+            session = MarketDataSession()
             bs = session.__enter__()
             total = len(symbols)
             for i, symbol in enumerate(symbols, start=1):
@@ -241,8 +241,6 @@ class DataEngine:
                         break
 
                     except Exception as exc:
-                        if isinstance(exc, BaostockDailyLimitExceeded):
-                            raise
                         if attempt < max_retries - 1:
                             wait = 2 ** (attempt + 1)
                             logger.warning(
@@ -293,8 +291,8 @@ class DataEngine:
                     f"累计成功 {success}、跳过 {skipped}、失败 {failed}"
                 )
 
-        except BaostockDailyLimitExceeded as exc:
-            logger.error(str(exc))
+        except Exception as exc:
+            logger.error(f"历史回填失败（Baostock/AKShare）: {exc}")
         finally:
             if session is not None:
                 session.__exit__(None, None, None)
@@ -305,10 +303,10 @@ class DataEngine:
 
     def get_all_symbols(self) -> list[str]:
         """通过 baostock 获取全市场 A 股代码列表。"""
-        from sequoia_x.data.baostock_client import BaostockSession
+        from sequoia_x.data.baostock_client import MarketDataSession
 
         try:
-            with BaostockSession() as bs:
+            with MarketDataSession() as bs:
                 rs = bs.query_stock_basic(code_name="", code="")
                 symbols = []
                 while rs.next():
