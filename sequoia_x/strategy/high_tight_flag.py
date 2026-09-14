@@ -31,7 +31,7 @@ class HighTightFlagStrategy(BaseStrategy):
             满足条件的股票代码列表。
         """
         symbols = self.engine.get_local_symbols()
-        selected: list[str] = []
+        selected: list[tuple[str, float]] = []
 
         for symbol in symbols:
             try:
@@ -62,11 +62,18 @@ class HighTightFlagStrategy(BaseStrategy):
                 shrink = df["volume"].iloc[-1] < vol_ma20 * 0.6
 
                 if momentum and consolidation and high_level and shrink:
-                    selected.append(symbol)
+                    # 更强的前期动量、更窄的整理和更明显的缩量优先。
+                    score = (
+                        (high40 / low40)
+                        + (1 - high10 / low10)
+                        + (1 - df["volume"].iloc[-1] / vol_ma20)
+                    )
+                    selected.append((symbol, float(score)))
 
             except Exception as exc:
                 logger.warning(f"[{symbol}] HighTightFlagStrategy 计算失败：{exc}")
                 continue
 
+        selected.sort(key=lambda item: (-item[1], item[0]))
         logger.info(f"HighTightFlagStrategy 选出 {len(selected)} 只股票")
-        return selected
+        return [symbol for symbol, _ in selected]

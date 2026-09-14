@@ -31,7 +31,7 @@ class UptrendLimitDownStrategy(BaseStrategy):
             满足条件的股票代码列表。
         """
         symbols = self.engine.get_local_symbols()
-        selected: list[str] = []
+        selected: list[tuple[str, float]] = []
 
         for symbol in symbols:
             try:
@@ -57,11 +57,14 @@ class UptrendLimitDownStrategy(BaseStrategy):
                 volume_surge = today["volume"] > today["vol_ma20"] * 2.0
 
                 if uptrend and limit_down and volume_surge:
-                    selected.append(symbol)
+                    # 趋势越强、恐慌日放量越充分，优先级越高。
+                    score = (prev["ma20"] / prev["ma60"] - 1) + (today["volume"] / today["vol_ma20"])
+                    selected.append((symbol, float(score)))
 
             except Exception as exc:
                 logger.warning(f"[{symbol}] UptrendLimitDownStrategy 计算失败：{exc}")
                 continue
 
+        selected.sort(key=lambda item: (-item[1], item[0]))
         logger.info(f"UptrendLimitDownStrategy 选出 {len(selected)} 只股票")
-        return selected
+        return [symbol for symbol, _ in selected]

@@ -113,8 +113,11 @@ def main() -> None:
 
             selected: list[str] = strategy.run()
             raw_count = len(selected)
-            selected = selected[: FeishuNotifier.MAX_STOCKS_PER_STRATEGY]
-            logger.info(f"{strategy_name} 选出 {raw_count} 只，推送前 {len(selected)} 只")
+            selected = notifier.select_symbols(selected)
+            logger.info(
+                f"{strategy_name} 选出 {raw_count} 只，"
+                f"按策略评分取全市场前 {FeishuNotifier.MAX_STOCKS_PER_STRATEGY} 只推送 {len(selected)} 只"
+            )
 
             if selected:
                 notifier.send(

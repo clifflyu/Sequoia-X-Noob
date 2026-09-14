@@ -50,7 +50,9 @@ class RpsBreakoutStrategy(BaseStrategy):
 
         # 突破判定
         breakout_condition = strong_stocks['close'] >= strong_stocks['roll_high'] * 0.90
-        selected = strong_stocks[breakout_condition]
+        selected = strong_stocks[breakout_condition].sort_values(
+            ['rps', 'pct_change', 'symbol'], ascending=[False, False, True]
+        )
 
         logger.info(f"RpsBreakoutStrategy 选出 {len(selected)} 只股票")
         return selected['symbol'].tolist()

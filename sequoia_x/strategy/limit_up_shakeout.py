@@ -32,7 +32,7 @@ class LimitUpShakeoutStrategy(BaseStrategy):
             满足条件的股票代码列表。
         """
         symbols = self.engine.get_local_symbols()
-        selected: list[str] = []
+        selected: list[tuple[str, float]] = []
 
         for symbol in symbols:
             try:
@@ -55,11 +55,14 @@ class LimitUpShakeoutStrategy(BaseStrategy):
                 support_hold = today["low"] >= prev1["close"]
 
                 if limit_up_yesterday and bearish_today and volume_surge and support_hold:
-                    selected.append(symbol)
+                    # 洗盘日放量更充分、且低点离昨日收盘越远越强。
+                    score = (today["volume"] / prev1["volume"]) + (today["low"] / prev1["close"])
+                    selected.append((symbol, float(score)))
 
             except Exception as exc:
                 logger.warning(f"[{symbol}] LimitUpShakeoutStrategy 计算失败：{exc}")
                 continue
 
+        selected.sort(key=lambda item: (-item[1], item[0]))
         logger.info(f"LimitUpShakeoutStrategy 选出 {len(selected)} 只股票")
-        return selected
+        return [symbol for symbol, _ in selected]

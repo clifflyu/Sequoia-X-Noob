@@ -20,7 +20,7 @@ def make_settings(webhook_url: str = "https://example.com/default") -> Settings:
     )
 
 
-# Feature: 每个策略的飞书通知最多推送 3 只股票
+# Feature: 每个策略的飞书通知只推送全市场排名前 3 只股票
 @given(
     symbols=st.lists(
         st.text(min_size=6, max_size=6, alphabet="0123456789"),
@@ -28,10 +28,11 @@ def make_settings(webhook_url: str = "https://example.com/default") -> Settings:
     )
 )
 @h_settings(max_examples=50)
-def test_notification_contains_at_most_three_symbols(symbols: list[str]) -> None:
-    """通知仅包含输入列表的前 3 个股票代码。"""
+def test_notification_contains_top_three_symbols(symbols: list[str]) -> None:
+    """通知只保留策略排序靠前的三只股票。"""
     settings = make_settings()
     notifier = FeishuNotifier(settings)
+    expected = notifier.select_symbols(symbols)
 
     with patch.object(notifier, "_get_stock_names", return_value={}):
         with patch("requests.post") as mock_post:
@@ -41,10 +42,20 @@ def test_notification_contains_at_most_three_symbols(symbols: list[str]) -> None
     call_args = mock_post.call_args
     body = json.loads(call_args.kwargs.get("data") or call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs["data"])
     card_text = json.dumps(body)
-    for symbol in symbols[:3]:
+    for symbol in expected:
         assert symbol in card_text
-    for symbol in symbols[3:]:
+    for symbol in set(symbols) - set(expected):
         assert symbol not in card_text
+
+
+def test_select_symbols_keeps_first_three() -> None:
+    notifier = FeishuNotifier(make_settings())
+
+    selected = notifier.select_symbols(
+        ["000001", "000002", "000003", "000004", "600001", "600002", "600003", "600004"]
+    )
+
+    assert selected == ["000001", "000002", "000003"]
 
 
 def test_notification_includes_trade_plan() -> None:

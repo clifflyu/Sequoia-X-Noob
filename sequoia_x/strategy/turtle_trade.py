@@ -23,28 +23,28 @@ class TurtleTradeStrategy(BaseStrategy):
     webhook_key: str = "turtle"
     _MIN_BARS: int = 21  # 至少需要 21 根 K 线（20日窗口 + 当日）
 
-    def _get_market_caps(self, symbols: list[str]) -> dict[str, float]:
+    def _get_market_caps(self, symbols: list[str], trade_date: str) -> dict[str, float]:
         """通过 baostock 查询候选股票的流通市值（不复权收盘价 × 流通股本）。
 
         流通股本 = 成交量 / (换手率% / 100)
         流通市值 = 流通股本 × 不复权收盘价
         """
-        from datetime import date
-
         import baostock as bs
 
-        today_str = date.today().strftime("%Y-%m-%d")
         market_caps: dict[str, float] = {}
 
-        bs.login()
+        login = bs.login()
+        if login.error_code != "0":
+            logger.warning(f"baostock 登录失败，无法按流通市值排序: {login.error_msg}")
+            return market_caps
         try:
             for symbol in symbols:
                 bs_code = self.engine._to_baostock_code(symbol)
                 rs = bs.query_history_k_data_plus(
                     bs_code,
                     "close,volume,turn",
-                    start_date=today_str,
-                    end_date=today_str,
+                    start_date=trade_date,
+                    end_date=trade_date,
                     frequency="d",
                     adjustflag="3",  # 不复权，真实价格
                 )
@@ -69,7 +69,7 @@ class TurtleTradeStrategy(BaseStrategy):
         遍历全市场，返回满足海龟突破条件的股票代码列表。
         """
         symbols = self.engine.get_local_symbols()
-        candidates: list[str] = []
+        candidates: list[tuple[str, str]] = []
 
         for symbol in symbols:
             try:
@@ -96,7 +96,7 @@ class TurtleTradeStrategy(BaseStrategy):
                 is_up = last["close"] > prev["close"]    # 必须是真涨，不能是假阳线
 
                 if breakout and liquid and is_yang and is_up:
-                    candidates.append(symbol)
+                    candidates.append((symbol, str(last["date"])[:10]))
 
             except Exception as exc:
                 logger.warning(f"[{symbol}] TurtleTradeStrategy 计算失败：{exc}")
@@ -104,8 +104,11 @@ class TurtleTradeStrategy(BaseStrategy):
 
         # 按流通市值从大到小排序
         if candidates:
-            market_caps = self._get_market_caps(candidates)
-            candidates.sort(key=lambda s: market_caps.get(s, 0), reverse=True)
+            # 全市场日线通常同步至同一交易日；取最新信号日，不能使用自然日，
+            # 否则非交易日会让市值查询全部落空、退化成数据库遍历顺序。
+            trade_date = max(date for _, date in candidates)
+            market_caps = self._get_market_caps([symbol for symbol, _ in candidates], trade_date)
+            candidates.sort(key=lambda item: (-market_caps.get(item[0], 0), item[0]))
 
         logger.info(f"TurtleTradeStrategy 选出 {len(candidates)} 只股票")
-        return candidates
+        return [symbol for symbol, _ in candidates]

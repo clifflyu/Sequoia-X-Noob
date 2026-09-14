@@ -29,7 +29,7 @@ class MaVolumeStrategy(BaseStrategy):
             满足条件的股票代码列表。
         """
         symbols = self.engine.get_local_symbols()
-        selected: list[str] = []
+        selected: list[tuple[str, float]] = []
 
         for symbol in symbols:
             try:
@@ -53,11 +53,14 @@ class MaVolumeStrategy(BaseStrategy):
                 volume_surge = last["volume"] > last["vol_ma20"] * 1.5
 
                 if golden_cross and volume_surge:
-                    selected.append(symbol)
+                    # 金叉幅度和放量倍数越大，确认强度越高。
+                    score = (last["ma5"] / last["ma20"] - 1) + (last["volume"] / last["vol_ma20"])
+                    selected.append((symbol, float(score)))
 
             except Exception as exc:
                 logger.warning(f"[{symbol}] 策略计算失败：{exc}")
                 continue
 
+        selected.sort(key=lambda item: (-item[1], item[0]))
         logger.info(f"MaVolumeStrategy 选出 {len(selected)} 只股票")
-        return selected
+        return [symbol for symbol, _ in selected]

@@ -29,6 +29,11 @@ class FeishuNotifier:
         """
         self.settings = settings
         self.engine = engine
+        # ``stock_daily`` stores 后复权价 for strategy calculations.  A trade
+        # plan, however, must quote the market's actual (unadjusted) price.
+        # This cache is populated once per Feishu card build and is keyed by
+        # (symbol, signal date).
+        self._unadjusted_signal_prices: dict[tuple[str, str], tuple[float, float]] = {}
 
     @staticmethod
     def _to_xueqiu_code(code: str) -> str:
@@ -38,6 +43,11 @@ class FeishuNotifier:
         elif code.startswith(("4", "8")):
             return f"BJ{code}"
         return f"SZ{code}"
+
+    @classmethod
+    def select_symbols(cls, symbols: list[str]) -> list[str]:
+        """保留策略评分后的全市场排名，只取前 3 名。"""
+        return list(dict.fromkeys(symbols))[: cls.MAX_STOCKS_PER_STRATEGY]
 
     @staticmethod
     def _get_stock_names(symbols: list[str]) -> dict[str, str]:
@@ -58,6 +68,55 @@ class FeishuNotifier:
     def _price(value: float) -> str:
         """将价格格式化为两位小数。"""
         return f"{value:.2f}"
+
+    def _load_unadjusted_signal_prices(self, symbols: list[str]) -> None:
+        """读取信号日不复权高低价，用于展示可实际下单的价格。
+
+        策略库保留后复权价，避免除权除息破坏指标连续性；不能直接把该价格
+        用作委托价。Baostock 的 ``adjustflag=3`` 是不复权口径。
+        """
+        if self.engine is None:
+            return
+
+        signal_dates: dict[str, str] = {}
+        for symbol in symbols:
+            df = self.engine.get_ohlcv(symbol)
+            if not df.empty:
+                signal_dates[symbol] = str(df.iloc[-1]["date"])[:10]
+
+        if not signal_dates:
+            return
+
+        import baostock as bs
+
+        login = bs.login()
+        if login.error_code != "0":
+            logger.warning(f"baostock 登录失败，无法获取未复权交易计划价格: {login.error_msg}")
+            return
+
+        try:
+            for symbol, signal_date in signal_dates.items():
+                code = self.engine._to_baostock_code(symbol)
+                rs = bs.query_history_k_data_plus(
+                    code,
+                    "date,high,low",
+                    start_date=signal_date,
+                    end_date=signal_date,
+                    frequency="d",
+                    adjustflag="3",  # 不复权：交易所实际报价
+                )
+                if rs.error_code != "0" or not rs.next():
+                    logger.warning(f"[{symbol}] 未获取到信号日未复权价格: {rs.error_msg}")
+                    continue
+                _, high, low = rs.get_row_data()
+                entry, stop = float(high), float(low)
+                if entry > stop > 0:
+                    self._unadjusted_signal_prices[(symbol, signal_date)] = (entry, stop)
+        except Exception as exc:
+            # 行情补数失败时，通知仍应可以发送，只是不展示可能错误的价格。
+            logger.warning(f"未复权交易计划价格获取失败: {exc}")
+        finally:
+            bs.logout()
 
     def _trade_plan(self, symbol: str, strategy_name: str) -> tuple[str, str, str, str]:
         """为一个策略信号生成可执行的条件单计划。
@@ -87,9 +146,11 @@ class FeishuNotifier:
             if df.empty:
                 raise ValueError("无本地K线")
             last = df.iloc[-1]
-            entry = float(last["high"])
-            stop = float(last["low"])
             signal_date = str(last["date"])[:10]
+            prices = self._unadjusted_signal_prices.get((symbol, signal_date))
+            if prices is None:
+                raise ValueError("未取得信号日未复权价格")
+            entry, stop = prices
             if entry <= stop or stop <= 0:
                 raise ValueError("K线价格无效")
             target = entry + (entry - stop) * 2
@@ -121,8 +182,8 @@ class FeishuNotifier:
         return entry_text, stop_text, exit_text, signal_date
 
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
-        # 策略的原始结果可多于 3 只，但机器人只推送排在前面的 3 只。
-        symbols = symbols[: self.MAX_STOCKS_PER_STRATEGY]
+        symbols = self.select_symbols(symbols)
+        self._load_unadjusted_signal_prices(symbols)
         today = date.today().strftime("%Y-%m-%d")
         names = self._get_stock_names(symbols)
 
@@ -154,7 +215,7 @@ class FeishuNotifier:
                     "tag": "lark_md",
                     "content": (
                         f"**日期：** {today}\n**策略：** {strategy_name}\n"
-                        f"**推送数量：** {len(symbols)}（每个策略最多 3 只）"
+                        f"**推送数量：** {len(symbols)}（全市场最优前 3 只）"
                     ),
                 },
             },
