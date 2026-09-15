@@ -34,6 +34,10 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 class DataEngine:
     """行情数据引擎，负责 SQLite 存储和 baostock 数据同步。"""
 
+    # 降级到 AKShare 后每只票约 1s 且东财会对高频 IP 封禁；超过该规模直接跳过本轮，
+    # 宁可今天不补数据，也不要把出口 IP 打进黑名单。500 只约合 8 分钟。
+    AKSHARE_DEGRADED_MAX_TASKS = 500
+
     def __init__(self, settings: Settings) -> None:
         self.db_path: str = settings.db_path
         self.start_date: str = settings.start_date
@@ -82,6 +86,22 @@ class DataEngine:
 
     # ── 数据同步 ──
 
+    def _skip_degraded_full_market(self, provider: str, remaining: int) -> bool:
+        """判断是否该放弃本轮降级批量同步。
+
+        降级到 AKShare 后每只票约 1 秒，本库 2799 只意味着近 47 分钟、2799 次请求，
+        既跑不完，也会把出口 IP 送进东财的黑名单——线上那次 IP 被封就是这么来的。
+        """
+        if provider != "akshare" or remaining <= self.AKSHARE_DEGRADED_MAX_TASKS:
+            return False
+        logger.error(
+            f"已降级到 AKShare，剩余 {remaining} 只超过安全阈值 "
+            f"{self.AKSHARE_DEGRADED_MAX_TASKS} 只，已停止本次批量同步。"
+            "建议：1) 等 Baostock 恢复后重跑；2) 用 --symbols 分批补数"
+            "（如 --symbols 000001,600519）；3) 不要反复重跑全市场降级同步。"
+        )
+        return True
+
     def sync_today_bulk(self, symbols: list[str] | None = None) -> int:
         """同步本地股票或指定股票池的增量日 K 数据（后复权）。
 
@@ -129,7 +149,14 @@ class DataEngine:
         logger.info(f"需要更新 {len(tasks)} 只股票，按 Baostock 规则串行拉取...")
         try:
             with MarketDataSession() as bs:
-                for symbol, bs_code, start, end in tasks:
+                for index, (symbol, bs_code, start, end) in enumerate(tasks):
+                    # 降级可能发生在循环中途：首个请求失败就会永久切到 AKShare，
+                    # 所以每轮都要复查一次数据源，不能只在进场时判断。
+                    if self._skip_degraded_full_market(
+                        getattr(bs, "provider", "baostock"), len(tasks) - index
+                    ):
+                        # break 而非 return：中断前已取到的数据照常落库，下次按 MAX(date) 续传。
+                        break
                     rs = bs.query_history_k_data_plus(
                         bs_code, "date,open,high,low,close,volume,amount",
                         start_date=start, end_date=end, frequency="d", adjustflag="1",

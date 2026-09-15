@@ -95,21 +95,38 @@ class FeishuNotifier:
         try:
             with MarketDataSession() as bs:
                 for symbol, signal_date in signal_dates.items():
-                    code = self.engine._to_baostock_code(symbol)
-                    rs = bs.query_history_k_data_plus(
-                        code, "date,high,low", start_date=signal_date,
-                        end_date=signal_date, frequency="d", adjustflag="3",
-                    )
-                    if rs.error_code != "0" or not rs.next():
-                        logger.warning(f"[{symbol}] 未获取到信号日未复权价格: {rs.error_msg}")
-                        continue
-                    _, high, low = rs.get_row_data()
-                    entry, stop = float(high), float(low)
-                    if entry > stop > 0:
-                        self._unadjusted_signal_prices[(symbol, signal_date)] = (entry, stop)
+                    # 逐票隔离：单只票取数失败不能让整张卡片的委托价一起退化成
+                    # 「未取得」，所以异常必须在循环内消化掉。
+                    try:
+                        self._load_one_unadjusted_price(bs, symbol, signal_date)
+                    except Exception as exc:
+                        logger.warning(f"[{symbol}] 未复权交易计划价格获取失败: {exc}")
         except Exception as exc:
             # 行情补数失败时，通知仍应可以发送，只是不展示可能错误的价格。
             logger.warning(f"未复权交易计划价格获取失败: {exc}")
+
+    def _load_one_unadjusted_price(self, session, symbol: str, signal_date: str) -> None:
+        """取单只票信号日的不复权高低价；失败只影响该票。"""
+        code = self.engine._to_baostock_code(symbol)
+        rs = session.query_history_k_data_plus(
+            code, "date,high,low", start_date=signal_date,
+            end_date=signal_date, frequency="d", adjustflag="3",
+        )
+        if rs.error_code != "0":
+            logger.warning(f"[{symbol}] 未获取到信号日未复权价格: {rs.error_msg}")
+            return
+        while rs.next():
+            day, high, low = rs.get_row_data()
+            # 只认信号日那一行：区间语义一旦变化，宁可拿不到价，也不能拿错日期的价。
+            if str(day)[:10] != signal_date:
+                continue
+            entry, stop = float(high), float(low)
+            if entry > stop > 0:
+                self._unadjusted_signal_prices[(symbol, signal_date)] = (entry, stop)
+            else:
+                logger.warning(f"[{symbol}] {signal_date} 未复权高低价异常: high={high} low={low}")
+            return
+        logger.warning(f"[{symbol}] 未获取到 {signal_date} 的未复权价格")
 
     def _trade_plan(self, symbol: str, strategy_name: str) -> tuple[str, str, str, str]:
         """为一个策略信号生成可执行的条件单计划。
